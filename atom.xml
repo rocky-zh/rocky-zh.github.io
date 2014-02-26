@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title><![CDATA[Rocky's blog]]></title>
+  <subtitle><![CDATA[老妖]]></subtitle>
+  <link href="/atom.xml" rel="self"/>
+  <link href="http://yoursite.com/"/>
+  <updated>2014-02-26T07:33:59.126Z</updated>
+  <id>http://yoursite.com/</id>
+  
+  <author>
+    <name><![CDATA[rocky.zhang]]></name>
+    
+  </author>
+  
+  <generator uri="http://zespia.tw/hexo/">Hexo</generator>
+  
+  <entry>
+    <title><![CDATA[snowflake核心源码解读]]></title>
+    <link href="http://yoursite.com/2014/02/26/2014-02-25-snakeflake-source/"/>
+    <id>http://yoursite.com/2014/02/26/2014-02-25-snakeflake-source/</id>
+    <published>2014-02-26T06:45:03.000Z</published>
+    <updated>2014-02-26T06:45:31.000Z</updated>
+    <content type="html"><![CDATA[<h1 id="snowflake-">snowflake核心源码解读</h1>
+<p>来源：<a href="http://rockybean.info/2012/08/07/snowflake_theory/" target="_blank"><a href="http://rockybean.info/2012/08/07/snowflake_theory/">http://rockybean.info/2012/08/07/snowflake_theory/</a></a></p>
+<p>Snowflake是twitter开源的一款提供产生UID的网络服务软件，简介请猛击这里，另外笔者会另外写文章介绍其特性与使用，本文旨在描述snowflake是如何实现UID生成的。</p>
+<h2 id="snowflake-id-">Snowflake ID组成</h2>
+<p>Snowflake ID有64bits长，由以下三部分组成：</p>
+<ul>
+<li>time—42bits,精确到ms，那就意味着其可以表示长达(2^42-1)/(1000360024*365)=139.5年，另外使用者可以自己定义一个开始纪元（epoch)，然后用(当前时间-开始纪元）算出time，这表示在time这个部分在140年的时间里是不会重复的，官方文档在这里写成了41bits，应该是写错了。另外，这里用time还有一个很重要的原因，就是可以直接更具time进行排序，对于twitter这种更新频繁的应用，时间排序就显得尤为重要了。</li>
+<li>machine id—10bits,该部分其实由datacenterId和workerId两部分组成，这两部分是在配置文件中指明的。</li>
+<li>datacenterId的作用(个人看法)</li>
+</ul>
+<ol>
+<li>方便搭建多个生成uid的service，并保证uid不重复，比如在datacenter0将机器0，1，2组成了一个生成uid的service，而datacenter1此时也需要一个生成uid的service，从本中心获取uid显然是最快最方便的，那么它可以在自己中心搭建，只要保证datacenterId唯一。如果没有datacenterId，即用10bits，那么在搭建一个新的service前必须知道目前已经在用的id，否则不能保证生成的id唯一，比如搭建的两个uid service中都有machine id为100的机器，如果其server时间相同，那么产生相同id的情况不可避免。</li>
+<li>加快server启动速度。启动一台uid server时，会去检查zk同workerId目录中其他机器的情况，如其在zk上注册的id和向它请求返回的work_id是否相同，是否处同一个datacenter下，另外还会检查该server的时间与目前已有机器的平均时间误差是否在10s范围内等，这些检查是会耗费一定时间的。将一个datacenter下的机器数限制在32台(5bits)以内，在一定程度上也保证了server的启动速度。</li>
+</ol>
+<ul>
+<li>workerId是实际server机器的代号，最大到32，同一个datacenter下的workerId是不能重复的。它会被注册到zookeeper上，确保workerId未被其他机器占用，并将host:port值存入，注册成功后就可以对外提供服务了。</li>
+<li>sequence id —12bits,该id可以表示4096个数字，它是在time相同的情况下，递增该值直到为0，即一个循环结束，此时便只能等到下一个ms到来，一般情况下4096/ms的请求是不太可能出现的，所以足够使用了。</li>
+</ul>
+<p>Snowflake ID便是通过这三部分实现了UID的产生，策略也并不复杂。下面我们来看看它的一些关键源码。</p>
+<h2 id="idworker-scala-com-twitter-service-snowflake-">IdWorker.scala(com.twitter.service.snowflake)</h2>
+<p>UID生成的核心代码都在这个文件里，我们先来看看其中的一些常量定义。</p>
+<h3 id="-">常量</h3>
+<figure class="highlight"><table><tr><td class="gutter"><pre>1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+</pre></td><td class="code"><pre> <span class="comment">//自定义的开始纪元，这里貌似是tweet纪元，但我算出的结果是Nov 04 09:42:54 CST 2010，不大对</span>
+ val twepoch = <span class="number">1288834974657</span>L
+ <span class="comment">//workerID的字节数</span>
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val workerIdBits = <span class="number">5</span>L
+ <span class="comment">//datacenterId的字节数</span>
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val datacenterIdBits = <span class="number">5</span>L
+ <span class="comment">//workerId和datacenterId的最大表示值</span>
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val maxWorkerId = -<span class="number">1</span>L ^ (-<span class="number">1</span>L &lt;&lt; workerIdBits)<span class="comment">//2^5-1</span>
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val maxDatacenterId = -<span class="number">1</span>L ^ (-<span class="number">1</span>L &lt;&lt; datacenterIdBits)<span class="comment">//2^5-1</span>
+ <span class="comment">//sequenceId的字节数</span>
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val sequenceBits = <span class="number">12</span>L
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val sequenceMask = -<span class="number">1</span>L ^ (-<span class="number">1</span>L &lt;&lt; sequenceBits)
+ <span class="comment">//各个id对应的偏移值</span>
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val workerIdShift = sequenceBits<span class="comment">//12</span>
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val datacenterIdShift = sequenceBits + workerIdBits<span class="comment">//12+5=17</span>
+ <span class="keyword">private</span>[<span class="keyword">this</span>] val timestampLeftShift = sequenceBits + workerIdBits + datacenterIdBits<span class="comment">//12+5+5=22</span>
+
+ <span class="keyword">private</span>[<span class="keyword">this</span>] <span class="keyword">var</span> lastTimestamp = -<span class="number">1</span>L
+</pre></td></tr></table></figure>
+
+<p>各个变量的含义请看注释，workerId和datacenterId都是配置文件定义好的，没什么可说的，下面我们看下time和sequence id的产生源码。</p>
+<figure class="highlight"><table><tr><td class="gutter"><pre>1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+</pre></td><td class="code"><pre><span class="keyword">protected</span>[snowflake] def <span class="title">nextId</span>(): Long = synchronized {
+    <span class="comment">//获取当前时间,ms</span>
+    <span class="keyword">var</span> timestamp = timeGen()
+    <span class="comment">//lastTimestamp中记录着上一次产生id的时间戳</span>
+	<span class="keyword">if</span> (timestamp &lt; lastTimestamp) {
+    	<span class="comment">//小于，机器时间出问题了</span>
+       exceptionCounter.incr(<span class="number">1</span>)
+       log.error(<span class="string">"clock is moving backwards.  Rejecting requests until %d."</span>, lastTimestamp);
+       <span class="keyword">throw</span> <span class="keyword">new</span> InvalidSystemClock(<span class="string">"Clock moved backwards.  Refusing to generate id for %d milliseconds"</span>.format(
+         lastTimestamp - timestamp))
+     }
+ 	<span class="comment">//相等，递增sequence id</span>
+     <span class="keyword">if</span> (lastTimestamp == timestamp) {
+       sequence = (sequence + <span class="number">1</span>) & sequenceMask
+       <span class="comment">//递增过程中sequence为0了，表明sequence 值用尽了，等待下一个ms的到来。</span>
+       <span class="keyword">if</span> (sequence == <span class="number">0</span>) {
+         timestamp = tilNextMillis(lastTimestamp)
+       }
+     } <span class="keyword">else</span> {
+     <span class="comment">//大于，将sequence设为0，从头递增</span>
+       sequence = <span class="number">0</span>
+     }
+ 	<span class="comment">//记录此次产生id的时间戳</span>
+     lastTimestamp = timestamp
+     <span class="comment">//通过shift组装返回id</span>
+     ((timestamp - twepoch) &lt;&lt; timestampLeftShift) |
+       (datacenterId &lt;&lt; datacenterIdShift) |
+       (workerId &lt;&lt; workerIdShift) | 
+       sequence
+   }
+</pre></td></tr></table></figure>
+
+<p>通过上面的注释相信大家已经明白time和sequence id产生的过程了，是不是特别简单？！优雅的设计带来的也往往是简洁的代码。</p>
+]]></content>
+    
+    
+      <category term="代码分析" scheme="http://yoursite.com/tags/%E4%BB%A3%E7%A0%81%E5%88%86%E6%9E%90/"/>
+    
+  </entry>
+  
+  <entry>
+    <title><![CDATA[Hello World]]></title>
+    <link href="http://yoursite.com/2014/02/26/hello-world/"/>
+    <id>http://yoursite.com/2014/02/26/hello-world/</id>
+    <published>2014-02-26T06:33:09.000Z</published>
+    <updated>2014-02-26T06:33:09.000Z</updated>
+    <content type="html"><![CDATA[<p>Welcome to <a href="http://zespia.tw/hexo" target="_blank">Hexo</a>! This is your very first post. Check <a href="http://zespia.tw/hexo/docs" target="_blank">documentation</a> to learn how to use.</p>
+]]></content>
+    
+    
+  </entry>
+  
+</feed>
